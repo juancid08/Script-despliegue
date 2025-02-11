@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Plantilla Basica Grupos de Seguridad
+
+Resources:
+  SSHSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Trafico SSH
+      GroupName: SSHSecurityGroup
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+  HTTPSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Trafico HTTP
+      GroupName: HTTPSecurityGroup
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+  TomcatSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Trafico en puerto 80
+      GroupName: TomcatSecurityGroup
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+          
+Outputs:
+  SSHSecurityGroupId:
+    Description: ID grupo de seguridad SSH
+    Value: !Ref SSHSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SSHSecurityGroupId"
+  HTTPSecurityGroupId:
+    Description: ID grupo de seguridad HTTP
+    Value: !Ref HTTPSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-HttpSecurityGroupId"
+  TomcatSecurityGroupId:
+    Description: ID grupo de seguridad Tomcat
+    Value: !Ref TomcatSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-TomcatSecurityGroupId"

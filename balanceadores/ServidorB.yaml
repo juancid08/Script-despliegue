@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Plantilla Optimizada para Ubuntu con Tomcat y Apache
+
+# Parámetros
+Parameters:
+  SecGroupStack:
+    Description: Nombre de la pila de seguridad
+    Type: String
+    Default: SecurityGroupsFBB
+  ServerInstance:
+    Description: Nombre de la instancia
+    Type: String
+    Default: TomcatServer
+  InstanceSize:
+    Description: Tipo de instancia permitido (t2.micro, t2.small, t2.nano)
+    Type: String
+    Default: t2.small
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.nano
+  AMIImage:
+    Description: ID de la imagen de la instancia
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id'
+
+# Recursos
+Resources:
+  # Servidor Backend principal
+  BackendInstance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+        Count: 1
+    Properties:
+      ImageId: !Ref AMIImage
+      InstanceType: !Ref InstanceSize
+      KeyName: vockey
+      SecurityGroupIds:
+        - Fn::ImportValue:
+            !Sub "${SecGroupStack}-SecureSSHGroupId"
+        - Fn::ImportValue:
+            !Sub "${SecGroupStack}-WebAccessGroupId"
+      Tags:
+        - Key: Name
+          Value: BackendInstance
+      UserData: 
+        Fn::Base64: 
+          !Sub |
+            #!/bin/bash -xe
+            exec > /tmp/userdata.log 2>&1
+
+            # INTALAMOS VARIAS COSAS
+
+            apt update -y
+            apt install python3-pip -y
+            pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+            ln -s /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+            
+            # Instalación y configuración de Java y Tomcat
+            apt install openjdk-21-jdk -y
+            useradd -m -d /opt/tomcat -U -s /bin/false tomcat
+            cd /tmp
+            wget https://dlcdn.apache.org/tomcat/tomcat-11/v11.0.3/bin/apache-tomcat-11.0.3.tar.gz
+            tar xzvf apache-tomcat-11*tar.gz -C /opt/tomcat --strip-components=1
+            chown -R tomcat:tomcat /opt/tomcat/
+            chmod -R u+x /opt/tomcat/bin
+            
+            # CONFIGURAMOS USUARIO
+            sed -i '/<\/tomcat-users>/i \
+            <role rolename="manager-gui" />\n\
+            <user username="manager" password="manager_pass" roles="manager-gui" />\n\
+            <role rolename="admin-gui" />\n\
+            <user username="admin" password="admin_pass" roles="manager-gui,admin-gui" />' /opt/tomcat/conf/tomcat-users.xml
+            
+            # CONFIGURAMOS TOMCAT
+            echo '[Unit]
+            Description=Tomcat Server
+            After=network.target
+            
+            [Service]
+            Type=forking
+            User=tomcat
+            Group=tomcat
+            ExecStart=/opt/tomcat/bin/startup.sh
+            ExecStop=/opt/tomcat/bin/shutdown.sh
+            RestartSec=10
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target' | sudo tee /etc/systemd/system/tomcat.service
+            
+            systemctl daemon-reload
+            systemctl enable tomcat
+            systemctl start tomcat
+            
+             apt install git -y
+
+            # CLONAMOS EL REPOSITORIO
+            git clone https://github.com/DavidHormigoRamirez/studentify.git /opt/studentify
+
+            # DAMOS PERMISOS
+            chmod +x /opt/studentify/gradlew
+
+            
+            cd /opt/studentify
+            ./gradlew build
+
+            # COPIAMOS EL FICHERO PARA CAMBIARLO DE SITIO
+            cp build/libs/studentify-1.0.0.war /opt/tomcat/webapps/studentify.war
+            
+            # REINICIAMO
+            systemctl restart tomcat
+
+            /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource BackendInstance --region ${AWS::Region}
+
+  # Primera instancia Frontend
+  FrontendInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMIImage
+      InstanceType: !Ref InstanceSize
+      KeyName: vockey
+      SecurityGroupIds:
+        - Fn::ImportValue: 
+            !Sub "${SecGroupStack}-SecureSSHGroupId"
+        - Fn::ImportValue: 
+            !Sub "${SecGroupStack}-HttpTrafficGroupId"
+      Tags:
+        - Key: Name
+          Value: FrontendInstance1
+      UserData: 
+        Fn::Base64: 
+          !Sub 
+            - |
+              #!/bin/bash -xe
+              exec > /tmp/userdata.log 2>&1
+
+              # INSTALAMOS VARIAS COSAS
+
+              apt update -y
+              apt install python3-pip -y
+              pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+              ln -s /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+
+              # INTALAMOS APACHE
+
+              apt install apache2 -y
+              a2enmod proxy
+              a2enmod proxy_http
+
+              echo '<VirtualHost *:80>
+                DocumentRoot /var/www/students
+                ProxyPass /api/ http://${BackendServerIp}:8080/studentify/api/
+                ProxyPassReverse /api/ http://${BackendServerIp}:8080/studentify/api/
+              </VirtualHost>' | sudo tee /etc/apache2/sites-available/students.conf
+
+              a2ensite students
+              a2dissite 000-default
+
+              cd /tmp
+              git clone https://github.com/DavidHormigoRamirez/frontend_daw.git
+              cd frontend_daw
+              sed -i "s#fetch('CAMBIAR')#fetch('/api/students')#g" index.html
+              sed -i "s#fetch('CAMBIAR',#fetch('/api/students',#g" create.html
+              mkdir /var/www/students
+              cp *.html /var/www/students
+
+              systemctl restart apache2
+
+
+              # ESTO LO TENGO QUE PONER SIEMPRE
+              /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource FrontendServer1 --region ${AWS::Region}
+            - BackendServerIp: !GetAtt BackendInstance.PrivateIp
+
+
+  FrontendInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMIImage
+      InstanceType: !Ref InstanceSize
+      KeyName: vockey
+      SecurityGroupIds:
+        - Fn::ImportValue: 
+            !Sub "${SecGroupStack}-SecureSSHGroupId"
+        - Fn::ImportValue: 
+            !Sub "${SecGroupStack}-HttpTrafficGroupId"
+      Tags:
+        - Key: Name
+          Value: FrontendInstance2
+      UserData: 
+        Fn::Base64: 
+          !Sub 
+            - |
+              #!/bin/bash -xe
+              exec > /tmp/userdata.log 2>&1
+
+              # INSTALAMOS VARIOS ARCHIVOS
+
+              apt update -y
+              apt install python3-pip -y
+              pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+              ln -s /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+
+              # INSTALAMOS APACHE
+
+              apt install apache2 -y
+              a2enmod proxy
+              a2enmod proxy_http
+
+              echo '<VirtualHost *:80>
+                DocumentRoot /var/www/students
+                ProxyPass /api/ http://${BackendServerIp}:8080/studentify/api/
+                ProxyPassReverse /api/ http://${BackendServerIp}:8080/studentify/api/
+              </VirtualHost>' | sudo tee /etc/apache2/sites-available/students.conf
+
+              a2ensite students
+              a2dissite 000-default
+
+              cd /tmp
+              git clone https://github.com/DavidHormigoRamirez/frontend_daw.git
+              cd frontend_daw
+              sed -i "s#fetch('CAMBIAR')#fetch('/api/students')#g" index.html
+              sed -i "s#fetch('CAMBIAR',#fetch('/api/students',#g" create.html
+              mkdir /var/www/students
+              cp *.html /var/www/students
+
+              systemctl restart apache2
+
+              # LO DEBO DE PONER SIEMPRE
+              /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource FrontendServer2 --region ${AWS::Region}
+            - BackendServerIp: !GetAtt BackendInstance.PrivateIp
+
+ # Balanceador de carga
+  LoadBalancerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMIImage
+      InstanceType: !Ref InstanceSize
+      KeyName: vockey
+      SecurityGroupIds:
+        - Fn::ImportValue:
+            !Sub "${SecGroupStack}-SecureSSHGroupId"
+        - Fn::ImportValue:
+            !Sub "${SecGroupStack}-HttpTrafficGroupId"
+      Tags:
+        - Key: Name
+          Value: LoadBalancerInstance
+      UserData:
+        Fn::Base64: 
+          !Sub 
+            - |
+              #!/bin/bash -xe 
+              exec > /tmp/userdata.log 2>&1 
+
+              # INSTALO VARIAS COSAS
+
+
+              sed -i "s/#\$nrconf{kernelhints} = -1;/\$nrconf{kernelhints} = -1;/g" /etc/needrestart/needrestart.conf  
+              apt update -y 
+              apt upgrade -y 
+              apt install python3-pip -y  
+              pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz  
+              ln -s /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup  
+
+              # DESCARGAMOS APACHE
+
+              apt install apache2 -y
+              a2enmod proxy
+              a2enmod proxy_http
+              a2enmod proxy_balancer
+              a2enmod lbmethod_byrequests
+
+              # CONFIGURAMOS APACHE
+
+              echo '<VirtualHost *:80>
+                  DocumentRoot /var/www/html
+    
+                  <Proxy balancer://frontend_servers>
+
+                    BalancerMember http://${FrontendServer1Ip}
+                    BalancerMember http://${FrontendServer2Ip}
+
+                    ProxySet lbmethod=byrequests
+                  </Proxy>
+
+                  ProxyPass "/" "balancer://frontend_servers/"
+                  ProxyPassReverse "/" "balancer://frontend_servers/"
+              </VirtualHost>' | sudo tee /etc/apache2/sites-available/000-default.conf
+
+              
+              a2ensite 000-default
+
+              # REINICIAMOS
+              systemctl restart apache2
+              
+
+
+              # ESTO LO TENGO QUE PONER SIEMPRE
+              /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource LoadBalancerServer --region ${AWS::Region}
+            - FrontendServer1Ip: !GetAtt FrontendInstance1.PrivateIp
+              FrontendServer2Ip: !GetAtt FrontendInstance2.PrivateIp
+
+Outputs:
+  ApplicationHealthEndpoint:
+    Description: URL de verificación de salud de la aplicación
+    Value: 
+      Fn::Sub:
+        - "http://${PUBLICDNS}:8080/studentify/api/health"
+        - PUBLICDNS: !GetAtt BackendInstance.PublicDnsName
